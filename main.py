@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from playwright.async_api import async_playwright
 import urllib.parse
 import asyncio
+import json
 import os
 import re
 
@@ -18,7 +19,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Static files (frontend)
 if os.path.exists("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -28,10 +28,8 @@ class TokenRequest(BaseModel):
 
 
 def extract_eat(raw: str) -> tuple[str, dict]:
-    """EAT token aur URL params extract karo."""
     raw = raw.strip()
     url_params = {}
-
     if "?" in raw:
         try:
             parsed = urllib.parse.urlparse(raw)
@@ -39,18 +37,15 @@ def extract_eat(raw: str) -> tuple[str, dict]:
             url_params = {k: v[0] for k, v in params.items()}
         except Exception:
             pass
-
     match = re.search(r'[?&]eat=([^&#\s]+)', raw)
     if match:
         eat = urllib.parse.unquote(match.group(1))
     else:
         eat = raw
-
     return eat, url_params
 
 
 async def get_token_via_browser(eat: str, url_params: dict) -> dict:
-    """Playwright se kiosgamer browser session simulate karo."""
     kiosgamer_url = (
         f"https://discstore.kiosgamer.co.id/"
         f"?eat={urllib.parse.quote(eat)}"
@@ -69,24 +64,39 @@ async def get_token_via_browser(eat: str, url_params: dict) -> dict:
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--single-process",
+                "--disable-blink-features=AutomationControlled",
             ]
         )
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 720},
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "Upgrade-Insecure-Requests": "1",
+            }
         )
-        page = await context.new_page()
 
+        # webdriver detection hatao
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+            window.chrome = {runtime: {}};
+        """)
+
+        page = await context.new_page()
         result = {}
 
-        # Network response intercept karo
         async def handle_response(response):
-            if "callback_redirect" in response.url or "oauth" in response.url:
+            if "callback_redirect" in response.url or "oauth/callback" in response.url:
                 try:
                     body = await response.text()
-                    import json
                     data = json.loads(body)
-                    if "access_token" in data or "token" in data:
+                    if "access_token" in data:
                         result.update(data)
                 except Exception:
                     pass
@@ -94,25 +104,28 @@ async def get_token_via_browser(eat: str, url_params: dict) -> dict:
         page.on("response", handle_response)
 
         try:
-            # Pehle main page load karo — session/cookies set hote hain
-            await page.goto("https://discstore.kiosgamer.co.id/", wait_until="domcontentloaded", timeout=15000)
-            await asyncio.sleep(1)
-
-            # Ab EAT URL navigate karo
-            await page.goto(kiosgamer_url, wait_until="networkidle", timeout=20000)
+            # Session cookies lene ke liye pehle main page kholo
+            await page.goto(
+                "https://discstore.kiosgamer.co.id/",
+                wait_until="domcontentloaded",
+                timeout=20000
+            )
             await asyncio.sleep(2)
 
-            # Page URL check karo — redirect hua kya
+            # EAT URL navigate karo
+            await page.goto(kiosgamer_url, wait_until="networkidle", timeout=25000)
+            await asyncio.sleep(3)
+
+            # URL mein access_token check karo
             current_url = page.url
             if "access_token" in current_url:
                 parsed = urllib.parse.urlparse(current_url)
                 params = urllib.parse.parse_qs(parsed.query)
                 result = {k: v[0] for k, v in params.items()}
 
-            # Page content se bhi try karo
+            # Page content mein JSON check karo
             if not result.get("access_token"):
                 content = await page.content()
-                import json
                 json_match = re.search(r'\{[^{}]*"access_token"[^{}]*\}', content)
                 if json_match:
                     try:
@@ -125,7 +138,6 @@ async def get_token_via_browser(eat: str, url_params: dict) -> dict:
         finally:
             await browser.close()
 
-        # Fallback: URL params se jo mila woh return karo
         if not result.get("access_token"):
             result.update({
                 "account_id": url_params.get("account_id", ""),
